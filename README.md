@@ -1,0 +1,1 @@
+This repository inculdes a few AWS Systems Manager (SSM) documents that I have found usefull.

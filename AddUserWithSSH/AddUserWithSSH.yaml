@@ -1,0 +1,31 @@
+---
+schemaVersion: '2.2'
+description: Add a user to Amazon Linux and configure SSH.
+  Purposes
+parameters:
+  UserName:
+    type: String
+    description: name of the user to add
+mainSteps:
+- action: aws:runShellScript
+  precondition:
+    StringEquals:
+    - platformType
+    - Linux
+  name: AddUserInLinux
+  inputs:
+    runCommand: 
+    - if id -u {{ UserName }} > /dev/null 2>&1; then
+    -   echo The user {{ UserName }} already exists
+    - else
+    -   echo Creating the user {{ UserName }}
+    -   adduser {{ UserName }}
+    -   echo Configuring ssh
+    -   mkdir ~{{ UserName }}/.ssh
+    -   chown {{ UserName }} ~{{ UserName }}/.ssh
+    -   chmod 700 ~{{ UserName }}/.ssh
+    -   touch ~{{ UserName }}/.ssh/authorized_keys
+    -   aws ssm get-parameter --name /ssh/public-key/{{ UserName }} --region us-east-1 --query Parameter.Value --with-decryption --output text > ~{{ UserName }}/.ssh/authorized_keys
+    -   chown {{ UserName }} ~{{ UserName }}/.ssh/authorized_keys
+    -   chmod 600 ~{{ UserName }}/.ssh/authorized_keys
+    - fi

@@ -1,0 +1,112 @@
+---
+schemaVersion: '2.2'
+description: Join a machine to a Directory Services domain with support to change the comuter name.
+  Purposes
+parameters:
+  DirectoryId:
+    type: String
+    description: ID of the Directory Services directory (e.g. d-1234567890)
+  DirectoryName:
+    type: String
+    description: The Name of the directory (e.g. corp.example.com)
+  OrganizationalUnit:
+    type: String
+    default: ''
+    description: 'Distinguished name of the Organizational Unit (e.g. ou=example,dc=example,dc=com). Optional in Windows, Required in Linux.'
+mainSteps:
+- action: aws:runPowerShellScript
+  precondition:
+    StringEquals:
+    - platformType
+    - Windows
+  name: JoinDomainInWindows
+  inputs:
+    runCommand: 
+    - Echo "Running as $ENV:UserName"
+    - $DirectoryId = '{{ DirectoryId }}'
+    - Echo "Using directory id $DirectoryId"
+    - $DirectoryName = '{{ DirectoryName }}'
+    - Echo "Using directory name $DirectoryName"
+    - # Check if an organizational unit was passed 
+    - $OrganizationalUnit = '{{ OrganizationalUnit }}'
+    - echo "Using organizational unit $OrganizationalUnit"
+    - # Check if the instance has a ComputerName tag 
+    - $ComputerName = $ENV:ComputerName
+    - Try { 
+    -   $InstanceId = (Invoke-WebRequest -Uri "http://169.254.169.254/latest/meta-data/instance-id" -UseBasicParsing).Content
+    -   Echo "Running on instance $InstanceId"
+    -   $Tags = Get-EC2Tag -Filter @{Name="key";Value="ComputerName"},@{Name="resource-id";Value=$InstanceId} 
+    -   If ($Tags.Length -eq 1) {
+    -     # If there is a ComputerName tag, rename the instance
+    -     $ComputerName = $Tags[0].Value
+    -     Echo "Changing the computer name to $ComputerName"
+    -     Rename-Computer -NewName $ComputerName
+    - '  } Else {'
+    -     Echo "The ComputerName tag was not found, computer name will not be changed"
+    - '  }'
+    - '} Finally {'
+    -   Echo "Using the computer name $ComputerName"
+    - '}'
+    - # Generate a one time password for the unsecure domain join
+    - '[Reflection.Assembly]::LoadWithPartialName("System.Web")'
+    - $Password = [system.web.security.membership]::GeneratePassword(12,2)
+    - $Credential = New-Object pscredential -ArgumentList ([pscustomobject]@{
+    -   UserName = $null
+    -   Password = (ConvertTo-SecureString -String $password -AsPlainText -Force)[0]
+    - '})'
+    - # Use AWS Directory Services API to create a computer account and then join the instance to the domain
+    - Echo "Creating a computer account in the directory."
+    - New-DSComputer -DirectoryId $DirectoryId -ComputerName $ComputerName -Password $Password -OrganizationalUnitDistinguishedName $OrganizationalUnit -ErrorAction Stop
+    - Echo "Joining the computer to the domain."
+    - Add-Computer -DomainName $DirectoryName -Credential $Credential -Options UnsecuredJoin,PasswordPass,JoinWithNewName -Restart -ErrorAction Stop
+- action: aws:runShellScript
+  precondition:
+    StringEquals:
+    - platformType
+    - Linux
+  name: JoinDomainInLinux
+  inputs:
+    runCommand: 
+    - echo "Running as $(whoami)""
+    - DirectoryId='{{ DirectoryId }}'
+    - echo "Using directory id $DirectoryId"
+    - DirectoryName='{{ DirectoryName }}'
+    - echo "Using directory name $DirectoryName"
+    - # Check if an organizational unit was passed 
+    - OrganizationalUnit='{{ OrganizationalUnit }}'
+    - If ($OrganizationalUnit.length -eq 0) {
+    -   Echo "No organizational unit passed, using default."
+    -   $OrganizationalUnit = $null
+    - '} Else {'  
+    -   Echo "Using organizational unit $OrganizationalUnit"
+    - '}'
+    - # Check if the instance has a ComputerName tag 
+    - ComputerName=$(hostname)
+    - InstanceId=$(curl -sS http://169.254.169.254/latest/meta-data/instance-id)
+    - echo "Running on instance $InstanceId"
+    - ComputerName=$(aws ec2 describe-tags --filters "Name=key,Values=ComputerName" "Name=resource-id,Values=$InstanceId" --query Tags[*].Value --output text)
+    - if [ -z $ComputerName ]; then 
+    -   echo "The ComputerName tag was not found, setting to private IP in hex"
+    -   IpAddress=$(hostname -I)
+    -   IpAddressHex=$(printf '%02X' ${IpAddress//./ })
+    -   $ComputerName=ip-$IpAddressHex
+    - fi
+    - echo "Setting hostname to $ComputerName"
+    - hostname $ComputerName
+    - sed -i "s/HOSTNAME=localhost.localdomain/HOSTNAME=$ComputerName.DirectoryName/g" /etc/sysconfig/network
+    - echo "Generate a one time password for the unsecure domain join"
+    - Password=$(date | md5sum | cut -c 1-16)
+
+    - echo "Installing ssd realmd and krb5-workstation"
+    - yum -y install sssd realmd krb5-workstation
+    - echo "Creating a computer account in the directory."
+    - aws ds create-computer --region us-east-1 --directory-id $DirectoryId --computer-name $ComputerName --password $Password --organizational-unit-distinguished-name $OrganizationalUnit
+    - echo "Joining the computer to the domain."
+    - realm join --one-time-password=$Password $DirectoryName --verbose
+    - sed -i "s/.*PasswordAuthentication.*/PasswordAuthentication yes/g" /etc/ssh/sshd_config
+    - echo Setting up access permissions 
+    - if [ -n "AWS\ Delegated\ Administrators@$DirectoryName" ]; then echo "%"AWS\ Delegated\ Administrators@$DirectoryName" ALL=(ALL:ALL) ALL" | sudo EDITOR='tee -a' visudo; fi
+    - if [ -n "$OrganizationalUnit" ]; then echo "ad_access_filter = (memberOf=$OrganizationalUnit)" | sudo tee -a /etc/sssd/sssd.conf; fi
+    - sudo service sssd start
+    - echo Rebooting instance
+    - sudo reboot now
